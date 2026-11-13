@@ -1,0 +1,7 @@
+.env
+.git
+.venv
+venv
+__pycache__
+*.pdf
+owkin_take_home_data (1).csv
