@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Original assignment files (the dataset lives in data/)
+Owkin technical test*.pdf
+owkin_take_home_data (1).csv
