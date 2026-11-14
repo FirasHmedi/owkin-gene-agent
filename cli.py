@@ -10,8 +10,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-from dotenv import load_dotenv
-
 from gene_agent.agent import Agent, Reply
 from gene_agent.errors import friendly_error
 
@@ -22,6 +20,15 @@ def show(reply: Reply, trace: bool) -> None:
             status = "error" if call.is_error else "ok"
             print(f"  [{call.name} {call.input} -> {status}] {call.output}", file=sys.stderr)
     print(reply.text)
+    if reply.ungrounded_numbers():
+        print("\n(Some figures above are not in the dataset. Rely on the data below.)")
+    data = reply.data_markdown()
+    if data:
+        print("\nFrom the dataset:\n" + data.replace("**", ""))
+
+
+def progress(done: int, total: int) -> None:
+    print(f"\rDownloading the model (first run only): {100 * done // total}%", end="", file=sys.stderr)
 
 
 def main() -> int:
@@ -30,9 +37,9 @@ def main() -> int:
     parser.add_argument("--trace", action="store_true", help="Print the data lookups behind each answer.")
     args = parser.parse_args()
 
-    load_dotenv()
+    agent = Agent()
     try:
-        agent = Agent()
+        agent.ensure_model(progress)
     except Exception as exc:
         print(friendly_error(exc), file=sys.stderr)
         return 1
@@ -45,7 +52,7 @@ def main() -> int:
             return 1
         return 0
 
-    print("Gene data assistant. Ask a question, or type 'exit' to quit.")
+    print(f"Gene data assistant (local model: {agent.model}). Ask a question, or type 'exit' to quit.")
     while True:
         try:
             question = input("\nYou: ").strip()

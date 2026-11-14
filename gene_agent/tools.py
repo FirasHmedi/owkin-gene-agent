@@ -67,54 +67,34 @@ def get_expressions(genes: List[str], cancer_name: str) -> Dict[str, float]:
 
 # --- Tool layer: what the model sees -------------------------------------
 
+
+def _tool(name: str, description: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties, "required": list(properties)},
+        },
+    }
+
+
 TOOLS: List[Dict[str, Any]] = [
-    {
-        "name": "get_targets",
-        "description": (
-            "List the genes the dataset associates with one cancer indication. "
-            "Call this whenever the user asks which genes are involved in a cancer, "
-            "and before get_expressions to learn which genes to look up. "
-            "Returns an error naming the available indications if the cancer is not in the dataset."
-        ),
-        "strict": True,
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "cancer_name": {
-                    "type": "string",
-                    "description": "Cancer indication as named in the dataset, e.g. 'lung' or 'breast'.",
-                }
-            },
-            "required": ["cancer_name"],
-            "additionalProperties": False,
+    _tool(
+        "get_targets",
+        "List the genes the dataset associates with one cancer. "
+        "Call this first for any question about a cancer's genes or their values.",
+        {"cancer_name": {"type": "string", "description": "Cancer name, e.g. 'lung' or 'breast'."}},
+    ),
+    _tool(
+        "get_expressions",
+        "Get the median expression value of each given gene within one cancer, "
+        "plus the median across those genes. Pass the genes returned by get_targets.",
+        {
+            "genes": {"type": "array", "items": {"type": "string"}, "description": "Gene symbols, e.g. ['KRAS', 'ALK']."},
+            "cancer_name": {"type": "string", "description": "The same cancer name used for get_targets."},
         },
-    },
-    {
-        "name": "get_expressions",
-        "description": (
-            "Look up the median expression value of each given gene within one cancer indication. "
-            "Values differ between cancers for the same gene, so the cancer is required. "
-            "Also returns a summary (count, median, min, max across the returned genes); "
-            "use those figures rather than calculating your own."
-        ),
-        "strict": True,
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "genes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Gene symbols, e.g. ['KRAS', 'ALK'].",
-                },
-                "cancer_name": {
-                    "type": "string",
-                    "description": "Cancer indication the values should come from, e.g. 'lung'.",
-                },
-            },
-            "required": ["genes", "cancer_name"],
-            "additionalProperties": False,
-        },
-    },
+    ),
 ]
 
 
@@ -124,6 +104,9 @@ def _run_get_targets(cancer_name: str) -> Dict[str, Any]:
 
 
 def _run_get_expressions(genes: List[str], cancer_name: str) -> Dict[str, Any]:
+    if isinstance(genes, str):  # small models sometimes send "KRAS, ALK" instead of a list
+        genes = [g for g in re.split(r"[,\s]+", genes.strip("[] ")) if g]
+    genes = [str(g).strip("'\" ") for g in genes]
     values = get_expressions(genes, cancer_name)
     found = {g.upper() for g in values}
     result: Dict[str, Any] = {

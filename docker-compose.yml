@@ -1,10 +1,20 @@
 services:
+  # Local model server. The app downloads the model into the volume on first run.
+  ollama:
+    image: ollama/ollama
+    volumes:
+      - ollama:/root/.ollama
+
   app:
     build: .
+    depends_on:
+      - ollama
     ports:
       - "8501:8501"
     environment:
-      # Read from your shell or from a .env file next to this one.
-      # If left empty, the web page asks for the key instead.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      OLLAMA_HOST: http://ollama:11434
+      # Optional: set OLLAMA_MODEL in your shell to try another model.
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+
+volumes:
+  ollama:
