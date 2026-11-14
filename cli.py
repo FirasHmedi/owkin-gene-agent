@@ -18,13 +18,9 @@ def show(reply: Reply, trace: bool) -> None:
     if trace:
         for call in reply.tool_calls:
             status = "error" if call.is_error else "ok"
-            print(f"  [{call.name} {call.input} -> {status}] {call.output}", file=sys.stderr)
-    print(reply.text)
-    if reply.ungrounded_numbers():
-        print("\n(Some figures above are not in the dataset. Rely on the data below.)")
-    data = reply.data_markdown()
-    if data:
-        print("\nFrom the dataset:\n" + data.replace("**", ""))
+            origin = ", added by the agent" if call.added_by_agent else ""
+            print(f"  [{call.name} {call.input} -> {status}{origin}] {call.output}", file=sys.stderr)
+    print(reply.text.replace("**", ""))
 
 
 def progress(done: int, total: int) -> None:

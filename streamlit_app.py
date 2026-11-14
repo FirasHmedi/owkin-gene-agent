@@ -24,18 +24,12 @@ st.caption("Ask questions about the cancer gene dataset in plain language.")
 
 def render_reply(reply: Reply) -> None:
     st.markdown(reply.text)
-    if reply.ungrounded_numbers():
-        st.warning("Some figures in the text above are not in the dataset. Rely on the data shown below.")
-    data = reply.data_markdown()
-    if data:
-        with st.container(border=True):
-            st.caption("From the dataset")
-            st.markdown(data)
     if reply.tool_calls:
         count = len(reply.tool_calls)
         with st.expander(f"How this answer was produced ({count} data lookup{'s' if count != 1 else ''})"):
             for call in reply.tool_calls:
-                st.markdown(f"**{call.name}**")
+                origin = " (added by the agent)" if call.added_by_agent else ""
+                st.markdown(f"**{call.name}**{origin}")
                 st.json({"input": call.input})
                 if call.is_error:
                     st.warning(call.output)

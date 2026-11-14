@@ -25,6 +25,9 @@ DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "owkin_take_home_d
 df = pd.read_csv(DATA_PATH)
 
 _CANCER_SUFFIX = re.compile(r"\s+(cancers?|carcinomas?|tumou?rs?)$")
+# Everyday names that mean exactly one dataset indication.
+_ALIASES = {"stomach": "gastric", "kidney": "renal"}
+NOT_IN_DATASET = "is not in the dataset"
 
 
 class UnknownCancerError(ValueError):
@@ -33,7 +36,7 @@ class UnknownCancerError(ValueError):
     def __init__(self, cancer_name: str):
         self.cancer_name = cancer_name
         super().__init__(
-            f"'{cancer_name}' is not in the dataset. "
+            f"'{cancer_name}' {NOT_IN_DATASET}. "
             f"Available cancer indications: {', '.join(available_cancers())}."
         )
 
@@ -43,12 +46,29 @@ def available_cancers() -> List[str]:
     return sorted(df["cancer_indication"].unique().tolist())
 
 
+def _plain(cancer_name: str) -> str:
+    return _CANCER_SUFFIX.sub("", str(cancer_name).strip().lower())
+
+
 def normalize_cancer(cancer_name: str) -> str:
-    """Map user-style input ("Lung cancer ") to the dataset key ("lung")."""
-    name = _CANCER_SUFFIX.sub("", str(cancer_name).strip().lower())
+    """Map user-style input ("Lung cancer ", "stomach") to the dataset key ("lung", "gastric")."""
+    name = _ALIASES.get(_plain(cancer_name), _plain(cancer_name))
     if name not in set(df["cancer_indication"]):
         raise UnknownCancerError(cancer_name)
     return name
+
+
+def is_cancer_name(text: str) -> bool:
+    try:
+        normalize_cancer(text)
+        return True
+    except UnknownCancerError:
+        return False
+
+
+def find_cancer(text: str) -> str:
+    """The first dataset cancer (or everyday name for one) mentioned in a text, or ''."""
+    return next((word for word in re.findall(r"[a-z]+", text.lower()) if is_cancer_name(word)), "")
 
 
 def get_targets(cancer_name: str) -> List[str]:
@@ -98,21 +118,41 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 
+def as_gene_list(genes: Any) -> List[str]:
+    """Accept a list, or the "KRAS, ALK" string small models sometimes send."""
+    if isinstance(genes, str):
+        genes = [g for g in re.split(r"[,\s]+", genes.strip("[] ")) if g]
+    return [str(g).strip("'\" ") for g in genes or []]
+
+
+def _asked_as(cancer_name: str) -> Dict[str, str]:
+    """Record the everyday name when one was used, so the answer can say so."""
+    return {"asked_as": _plain(cancer_name)} if _plain(cancer_name) in _ALIASES else {}
+
+
 def _run_get_targets(cancer_name: str) -> Dict[str, Any]:
-    genes = get_targets(cancer_name)
-    return {"cancer_indication": normalize_cancer(cancer_name), "gene_count": len(genes), "genes": genes}
+    cancer = normalize_cancer(cancer_name)
+    genes = get_targets(cancer)
+    return {
+        "cancer_indication": cancer,
+        **_asked_as(cancer_name),
+        "gene_count": len(genes),
+        "genes": genes,
+        "next_step": f"If the user asked for expression values, now call get_expressions "
+        f"with these {len(genes)} genes and cancer_name '{cancer}'.",
+    }
 
 
 def _run_get_expressions(genes: List[str], cancer_name: str) -> Dict[str, Any]:
-    if isinstance(genes, str):  # small models sometimes send "KRAS, ALK" instead of a list
-        genes = [g for g in re.split(r"[,\s]+", genes.strip("[] ")) if g]
-    genes = [str(g).strip("'\" ") for g in genes]
-    values = get_expressions(genes, cancer_name)
+    genes = as_gene_list(genes)
+    cancer = normalize_cancer(cancer_name)
+    values = get_expressions(genes, cancer)
     found = {g.upper() for g in values}
     result: Dict[str, Any] = {
-        "cancer_indication": normalize_cancer(cancer_name),
+        "cancer_indication": cancer,
+        **_asked_as(cancer_name),
         "median_values": values,
-        "genes_not_found_for_this_cancer": [g for g in genes if str(g).strip().upper() not in found],
+        "genes_not_found_for_this_cancer": [g for g in genes if g.upper() not in found],
     }
     if values:
         numbers = list(values.values())

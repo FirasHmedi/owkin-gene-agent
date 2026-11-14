@@ -1,12 +1,14 @@
-"""The agent: a tool-calling loop over the two dataset functions, run on a small local model.
+"""The agent: a tool-calling loop over the two dataset functions, run on a very small local model.
 
-The model decides which function to call and with what arguments; this module
-runs the calls, feeds the results back, and stops when the model has an answer.
+A model of a few hundred megabytes can work out what the user is asking and
+pick the right function. It cannot be trusted to plan two steps reliably or to
+quote figures, so the loop keeps those jobs in code:
 
-A small model is good enough to route a question to the right function, but
-it can misquote figures. So the facts shown to the user do not depend on its
-wording: every reply carries the tool results, rendered by code, and any
-number in the model's text that is not in those results is flagged.
+1. The model chooses which tools to call (and may chain them).
+2. The loop checks the arguments: genes must come from the user or the dataset.
+3. Any answer that contains data is written by code from the tool results.
+4. The model's own wording is used only for replies without data, and is
+   rejected if it mentions a gene or a number.
 """
 
 from __future__ import annotations
@@ -19,34 +21,40 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ollama import Client, ResponseError
 
-from .tools import TOOLS, available_cancers, execute_tool
+from .tools import (
+    NOT_IN_DATASET,
+    TOOLS,
+    as_gene_list,
+    available_cancers,
+    execute_tool,
+    find_cancer,
+    is_cancer_name,
+)
 
-DEFAULT_MODEL = "qwen3:1.7b"
+DEFAULT_MODEL = "qwen3:0.6b"
 # A question needs at most two tool rounds (targets, then expressions); the cap
 # only exists to stop a runaway loop.
-MAX_STEPS = 6
+MAX_STEPS = 5
+MAX_REPLY_TOKENS = 300
 
 SYSTEM_PROMPT = """\
-You answer questions about a small cancer gene dataset for non-technical users.
+You route questions about a cancer gene dataset to tools.
 
-The dataset covers only these cancers: {cancers}.
+Cancers in the dataset: {cancers}.
 
-Rules:
-- For any question about a cancer's genes, call get_targets with the cancer name.
-- For any question about expression values, call get_targets first, then call \
-get_expressions with those genes and the same cancer name.
-- Use only tool results for gene names and numbers. Never use your own knowledge.
-- If a tool says the cancer is not in the dataset, tell the user it is not \
-available and list the cancers that are. Give no genes and no numbers.
-- If the user uses an everyday name (stomach = gastric, kidney = renal), use the \
-dataset name and say so.
-- If asked what you can do, say you can list the genes for a cancer and give \
-their median expression values, and name the cancers covered. Do not call a tool.
-- Answer in one or two short plain sentences. The data table is shown to the \
-user separately, so do not repeat every value.\
+- If the user asks which genes are involved in a cancer, call get_targets.
+- If the user asks for expression values, call get_targets, then call \
+get_expressions with those genes and the same cancer.
+- Always call a tool when the question names a cancer, even one that is not in \
+the list. The tool reports missing cancers.
+- Never answer about genes or values from memory.
+- If the question is not about the data (for example "how can you help me?"), \
+reply in one or two sentences.\
 """
 
 _DECIMAL = re.compile(r"\d+\.\d+")
+_SYMBOL = re.compile(r"\b[A-Z][A-Z0-9]{2,7}\b")  # looks like a gene symbol: TP53, KRAS
+_NOT_GENES = {"DNA", "RNA", "CSV", "NOT", "AND", "THE", "YOU", "CAN"}
 
 
 @dataclass
@@ -55,39 +63,77 @@ class ToolCall:
     input: Dict[str, Any]
     output: str
     is_error: bool
+    added_by_agent: bool = False  # run by the loop itself, not requested by the model
 
 
 @dataclass
 class Reply:
     text: str
     tool_calls: List[ToolCall] = field(default_factory=list)
+    written_by: str = "code"  # "code" (from tool results), "model", or "fallback" (model reply rejected)
 
-    def data_markdown(self) -> str:
-        """The dataset facts behind this reply, rendered by code, not by the model."""
-        final: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for call in self.tool_calls:
-            if not call.is_error:
-                result = json.loads(call.output)
-                final[(call.name, result["cancer_indication"])] = result
 
-        parts = []
-        expression_cancers = {cancer for name, cancer in final if name == "get_expressions"}
-        for (name, cancer), result in final.items():
-            if name == "get_targets" and cancer not in expression_cancers:
-                parts.append(f"**Genes for {cancer} ({result['gene_count']}):** {', '.join(result['genes'])}")
-            elif name == "get_expressions" and result["median_values"]:
-                rows = "\n".join(f"| {gene} | {value} |" for gene, value in result["median_values"].items())
-                summary = result["summary"]
-                parts.append(
-                    f"**Median expression values for {cancer}**\n\n| Gene | Median value |\n|---|---|\n{rows}\n\n"
-                    f"Median across these {summary['gene_count']} genes: **{summary['median_across_genes']}**"
-                )
+def capabilities() -> str:
+    return (
+        "I can list the genes the dataset links to a cancer, and give their median expression values. "
+        f"Cancers covered: {', '.join(available_cancers())}."
+    )
+
+
+def _label(cancer: str) -> str:
+    return cancer if cancer in {"glioblastoma", "melanoma"} else f"{cancer} cancer"
+
+
+def write_answer(tool_calls: List[ToolCall]) -> Optional[str]:
+    """Write the answer from tool results. None if the tools gave nothing to report."""
+    targets: Dict[str, Dict[str, Any]] = {}
+    expressions: Dict[str, Dict[str, Any]] = {}
+    for call in tool_calls:
+        if not call.is_error:
+            result = json.loads(call.output)
+            (targets if call.name == "get_targets" else expressions)[result["cancer_indication"]] = result
+
+    parts = []
+    for cancer in dict.fromkeys([*targets, *expressions]):  # each cancer once, in order of first lookup
+        alias = (targets.get(cancer) or expressions[cancer]).get("asked_as")
+        prefix = f'"{alias.capitalize()}" is listed as {cancer} in the dataset. ' if alias else ""
+        if cancer not in expressions:
+            genes = targets[cancer]["genes"]
+            parts.append(f"{prefix}The dataset lists {len(genes)} genes for {_label(cancer)}: {', '.join(genes)}.")
+            continue
+
+        result = expressions[cancer]
+        values, summary = result["median_values"], result.get("summary")
+        missing = result["genes_not_found_for_this_cancer"]
+        if not values:
+            parts.append(f"{prefix}The dataset has no value for {', '.join(missing)} in {_label(cancer)}.")
+            continue
+        if len(values) == 1:
+            (gene, value), = values.items()
+            text = f"{prefix}In {_label(cancer)}, {gene} has a median expression value of **{value}**."
+        else:
+            rows = "\n".join(f"| {gene} | {value} |" for gene, value in values.items())
+            text = (
+                f"{prefix}Median expression values for {len(values)} genes in {_label(cancer)}:\n\n"
+                f"| Gene | Median value |\n|---|---|\n{rows}\n\n"
+                f"The median across these {summary['gene_count']} genes is **{summary['median_across_genes']}** "
+                f"(lowest {summary['min']}, highest {summary['max']})."
+            )
+        if missing:
+            text += f"\n\nNot listed for {_label(cancer)}: {', '.join(missing)}."
+        parts.append(text)
+    if parts:
         return "\n\n".join(parts)
 
-    def ungrounded_numbers(self) -> List[str]:
-        """Decimal numbers in the model's text that appear in no tool result."""
-        known = {float(n) for call in self.tool_calls if not call.is_error for n in _DECIMAL.findall(call.output)}
-        return [n for n in _DECIMAL.findall(self.text) if float(n) not in known]
+    for call in tool_calls:
+        if call.is_error and NOT_IN_DATASET in call.output:
+            return call.output
+    return None
+
+
+def invented_terms(text: str) -> List[str]:
+    """Numbers and gene-like symbols in a reply that had no tool result to take them from."""
+    return _DECIMAL.findall(text) + [s for s in _SYMBOL.findall(text) if s not in _NOT_GENES]
 
 
 class Agent:
@@ -118,53 +164,85 @@ class Agent:
         """Answer one user question, running tools as the model requests them."""
         checkpoint = len(self.messages)
         self.messages.append({"role": "user", "content": question})
-        completed = False
         try:
-            reply, completed = self._run()
-        finally:
-            if not completed:
-                # Drop the unfinished exchange so the next question starts clean.
-                del self.messages[checkpoint:]
+            model_text, tool_calls = self._run_tools()
+        except Exception:
+            del self.messages[checkpoint:]  # drop the unfinished exchange
+            raise
+
+        answer = write_answer(tool_calls)
+        if answer:
+            reply = Reply(answer, tool_calls, "code")
+        elif model_text and not invented_terms(model_text):
+            reply = Reply(f"{model_text}\n\n{capabilities()}", tool_calls, "model")
+        else:
+            reply = Reply(f"I could not match that to the dataset. {capabilities()}", tool_calls, "fallback")
+
+        # Keep what the user actually saw as the assistant turn, so follow-ups build on it.
+        del self.messages[checkpoint + 1 :]
+        self.messages.append({"role": "assistant", "content": reply.text})
         return reply
 
-    def _run(self) -> Tuple[Reply, bool]:
-        """Returns the reply and whether the exchange completed normally."""
+    def _run_tools(self) -> Tuple[str, List[ToolCall]]:
+        """Let the model call tools until it stops. Returns its final text and the calls made."""
         tool_calls: List[ToolCall] = []
         seen: set = set()
-        tools: Optional[List[Dict[str, Any]]] = TOOLS
 
         for _ in range(MAX_STEPS):
             response = self.client.chat(
                 model=self.model,
                 messages=[{"role": "system", "content": self.system}, *self.messages],
-                tools=tools,
+                tools=TOOLS,
                 think=False,
-                options={"temperature": 0},
+                options={"temperature": 0, "num_predict": MAX_REPLY_TOKENS},
             )
             message = response.message
             self.messages.append(message)
-
             if not message.tool_calls:
-                text = (message.content or "").strip()
-                if not text and any(not c.is_error for c in tool_calls):
-                    text = "Here is what the dataset contains."
-                return Reply(text or "I could not produce an answer. Please try again.", tool_calls), True
+                return (message.content or "").strip(), tool_calls
 
             new_calls = 0
             for call in message.tool_calls:
                 name, arguments = call.function.name, dict(call.function.arguments or {})
                 key = (name, json.dumps(arguments, sort_keys=True))
                 if key in seen:
-                    output, is_error = "You already made this call. Answer the user now.", True
+                    output = "You already made this call."
                 else:
                     seen.add(key)
                     new_calls += 1
+                    if name == "get_expressions":
+                        arguments = self._ground_genes(arguments, tool_calls)
                     output, is_error = execute_tool(name, arguments)
                     tool_calls.append(ToolCall(name, arguments, output, is_error))
                 self.messages.append({"role": "tool", "tool_name": name, "content": output})
 
-            if new_calls == 0:
-                # The model is repeating itself: withdraw the tools so the next turn must be an answer.
-                tools = None
+            if new_calls == 0:  # the model is repeating itself
+                break
+        return "", tool_calls
 
-        return Reply("I could not finish this request within the allowed number of steps.", tool_calls), False
+    def _ground_genes(self, arguments: Dict[str, Any], tool_calls: List[ToolCall]) -> Dict[str, Any]:
+        """Make sure the genes passed to get_expressions come from the user or the dataset.
+
+        Small models tend to skip get_targets and pass genes from memory, or put
+        the cancer name in the gene list. If any gene appears neither in the
+        conversation nor in an earlier tool result, the loop runs get_targets
+        itself and uses the dataset's list.
+        """
+        genes = as_gene_list(arguments.get("genes"))
+        said = [str(m["content"]) for m in self.messages if isinstance(m, dict) and m["role"] in ("user", "tool")]
+        question = next(m["content"] for m in reversed(self.messages) if isinstance(m, dict) and m["role"] == "user")
+        # A missing cancer name is taken from the gene list or the question, never guessed.
+        cancer = arguments.get("cancer_name") or next((g for g in genes if is_cancer_name(g)), find_cancer(question))
+        arguments = {**arguments, "cancer_name": cancer}
+
+        sources = " ".join(said).upper()
+        grounded = [g for g in genes if not is_cancer_name(g) and re.search(rf"\b{re.escape(g.upper())}\b", sources)]
+        if genes and len(grounded) == len(genes):
+            return arguments
+
+        lookup = {"cancer_name": cancer}
+        output, is_error = execute_tool("get_targets", lookup)
+        if is_error:
+            return arguments  # get_expressions will report the same problem
+        tool_calls.append(ToolCall("get_targets", lookup, output, False, added_by_agent=True))
+        return {**arguments, "genes": json.loads(output)["genes"]}
