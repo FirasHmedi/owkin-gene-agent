@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# Links the published image to this repository on GitHub.
+LABEL org.opencontainers.image.source=https://github.com/FirasHmedi/owkin-gene-agent
+
 WORKDIR /app
 
 COPY requirements.txt .
