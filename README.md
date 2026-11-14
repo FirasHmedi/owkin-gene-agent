@@ -32,7 +32,7 @@ Open http://localhost:8501 and click one of the example questions. The first sta
 
 ## Other ways to run it
 
-`docker compose up --build` starts two containers: the web app and [Ollama](https://ollama.com), which serves the model. The model is stored in a Docker volume, so later starts are quick.
+`docker compose up --build` starts two containers: the web app and [Ollama](https://ollama.com), which serves the model. The model is stored in a Docker volume, so later starts are quick. The app image is also published, for Intel and ARM machines, at `ghcr.io/firashmedi/owkin-gene-agent:latest`.
 
 Without Docker, you need Python 3.12 or newer and Ollama installed and running:
 
@@ -130,7 +130,7 @@ Each check was added after seeing a failure, so there may be failures I have not
 
 | Choice | Why | Cost |
 |---|---|---|
-| No agent framework | The loop is about 40 lines I can read from top to bottom | No built-in tracing or persistence |
+| No agent framework | The loop is about 50 lines I can read from top to bottom | No built-in tracing or persistence |
 | Ollama as model server | One official image for Intel and ARM, with tool calling | A second container |
 | Only the last exchange kept as context | Follow-ups work and a small model does not drift | Earlier turns are forgotten |
 | Unknown cancers return an error | A wrong guess would answer about a different cancer | The user has to rephrase |
