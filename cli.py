@@ -15,6 +15,7 @@ from gene_agent.errors import friendly_error
 
 
 def show(reply: Reply, trace: bool) -> None:
+    """Print an answer. With --trace, first print each data lookup to stderr."""
     if trace:
         for call in reply.tool_calls:
             status = "error" if call.is_error else "ok"
@@ -24,6 +25,7 @@ def show(reply: Reply, trace: bool) -> None:
 
 
 def progress(done: int, total: int) -> None:
+    """Progress line for the one-off model download."""
     print(f"\rDownloading the model (first run only): {100 * done // total}%", end="", file=sys.stderr)
 
 

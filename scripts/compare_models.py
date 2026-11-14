@@ -105,8 +105,8 @@ UNSEEN = [
 
 
 def run(model: str, cases: list) -> tuple:
-    """Returns (passed, seconds per question, failed questions)."""
-    passed, seconds, failed = 0, [], []
+    """Returns (passed, seconds per question, failed questions, two-step answers, planned by the model)."""
+    passed, seconds, failed, two_step, planned = 0, [], [], 0, 0
     for question, check in cases:
         agent = Agent(model=model)
         turns = [question] if isinstance(question, str) else question
@@ -121,18 +121,22 @@ def run(model: str, cases: list) -> tuple:
         passed += ok
         if not ok:
             failed.append(turns[-1])
-    return passed, seconds, failed
+        elif len(last_values(reply)) > 1:  # a correct answer that needed get_targets, then get_expressions
+            two_step += 1
+            planned += not any(c.added_by_agent for c in reply.tool_calls)
+    return passed, seconds, failed, two_step, planned
 
 
 if __name__ == "__main__":
     for model in sys.argv[1:]:
         Agent(model=model).ensure_model()
         results = [run(model, cases) for cases in (BRIEF, TUNED, UNSEEN)]
-        times = sorted(t for _, seconds, _ in results for t in seconds)
+        times = sorted(t for r in results for t in r[1])
         print(
             f"{model:16} brief {results[0][0]}/{len(BRIEF)}  tuned {results[1][0]}/{len(TUNED)}  "
-            f"unseen {results[2][0]}/{len(UNSEEN)}  median {times[len(times) // 2]:.1f}s"
+            f"unseen {results[2][0]}/{len(UNSEEN)}  median {times[len(times) // 2]:.1f}s  "
+            f"model planned {sum(r[4] for r in results)} of {sum(r[3] for r in results)} two-step answers"
         )
-        for _, _, failed in results:
-            for question in failed:
+        for r in results:
+            for question in r[2]:
                 print(f"    failed: {question}")

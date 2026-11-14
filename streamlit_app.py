@@ -1,4 +1,8 @@
-"""Web chat UI. Run with: streamlit run streamlit_app.py"""
+"""Web chat UI. Run with: streamlit run streamlit_app.py
+
+Streamlit re-runs this file from top to bottom on every interaction, so the
+agent and the chat history are kept in st.session_state between runs.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ st.caption("Ask questions about the cancer gene dataset in plain language.")
 
 
 def render_reply(reply: Reply) -> None:
+    """Show an answer and, in a collapsed panel, the data lookups behind it."""
     st.markdown(reply.text)
     if reply.tool_calls:
         count = len(reply.tool_calls)
@@ -37,6 +42,7 @@ def render_reply(reply: Reply) -> None:
                     st.json(json.loads(call.output))
 
 
+# First run of this browser session: create the agent and make sure the model is there.
 if "agent" not in st.session_state:
     agent = Agent()
     try:
@@ -63,12 +69,14 @@ with st.sidebar:
         history.clear()
         st.rerun()
 
+# Replay the conversation so far.
 for question, reply in history:
     with st.chat_message("user"):
         st.markdown(question)
     with st.chat_message("assistant"):
         render_reply(reply)
 
+# Example questions, shown until the first question is asked.
 clicked = None
 if not history:
     st.write("Try one of these:")

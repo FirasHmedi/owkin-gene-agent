@@ -1,4 +1,4 @@
-"""The two analysis functions from the brief, plus their tool definitions.
+"""The two analysis functions from the brief, and the tool layer the model calls them through.
 
 Two deliberate changes from the script in the brief (see README, "Changes to
 the provided functions"):
@@ -22,10 +22,15 @@ import pandas as pd
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "owkin_take_home_data.csv"
 
+# Columns: cancer_indication, gene, median_value. One row per (cancer, gene) pair.
 df = pd.read_csv(DATA_PATH)
 
+
+# --- Cancer names ---------------------------------------------------------
+
 _CANCER_SUFFIX = re.compile(r"\s+(cancers?|carcinomas?|tumou?rs?)$")
-# Everyday names that mean exactly one dataset indication.
+# Everyday names that mean exactly one dataset indication. Looser matches
+# ("colon", "brain") are left out on purpose: they are not the same thing.
 _ALIASES = {"stomach": "gastric", "kidney": "renal"}
 NOT_IN_DATASET = "is not in the dataset"
 
@@ -47,11 +52,16 @@ def available_cancers() -> List[str]:
 
 
 def _plain(cancer_name: str) -> str:
+    """Lower-case the name and drop a trailing "cancer": "Lung Cancer " -> "lung"."""
     return _CANCER_SUFFIX.sub("", str(cancer_name).strip().lower())
 
 
 def normalize_cancer(cancer_name: str) -> str:
-    """Map user-style input ("Lung cancer ", "stomach") to the dataset key ("lung", "gastric")."""
+    """Map user-style input ("Lung cancer ", "stomach") to the dataset key ("lung", "gastric").
+
+    Raises UnknownCancerError for anything else. There is no fuzzy matching,
+    because a near miss would answer about a different cancer.
+    """
     name = _ALIASES.get(_plain(cancer_name), _plain(cancer_name))
     if name not in set(df["cancer_indication"]):
         raise UnknownCancerError(cancer_name)
@@ -59,6 +69,7 @@ def normalize_cancer(cancer_name: str) -> str:
 
 
 def is_cancer_name(text: str) -> bool:
+    """True if the text names a cancer in the dataset."""
     try:
         normalize_cancer(text)
         return True
@@ -69,6 +80,9 @@ def is_cancer_name(text: str) -> bool:
 def find_cancer(text: str) -> str:
     """The first dataset cancer (or everyday name for one) mentioned in a text, or ''."""
     return next((word for word in re.findall(r"[a-z]+", text.lower()) if is_cancer_name(word)), "")
+
+
+# --- The two functions from the brief -------------------------------------
 
 
 def get_targets(cancer_name: str) -> List[str]:
@@ -85,10 +99,11 @@ def get_expressions(genes: List[str], cancer_name: str) -> Dict[str, float]:
     return dict(zip(subset["gene"].tolist(), subset["median_value"].tolist()))
 
 
-# --- Tool layer: what the model sees -------------------------------------
+# --- Tool layer: what the model sees and calls -----------------------------
 
 
 def _tool(name: str, description: str, properties: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a tool definition in the format the Ollama chat API expects."""
     return {
         "type": "function",
         "function": {
@@ -138,6 +153,7 @@ def _run_get_targets(cancer_name: str) -> Dict[str, Any]:
         **_asked_as(cancer_name),
         "gene_count": len(genes),
         "genes": genes,
+        # A hint for the model: the result itself says what the second step is.
         "next_step": f"If the user asked for expression values, now call get_expressions "
         f"with these {len(genes)} genes and cancer_name '{cancer}'.",
     }
@@ -155,6 +171,7 @@ def _run_get_expressions(genes: List[str], cancer_name: str) -> Dict[str, Any]:
         "genes_not_found_for_this_cancer": [g for g in genes if g.upper() not in found],
     }
     if values:
+        # Statistics are computed here so the model never does arithmetic.
         numbers = list(values.values())
         result["summary"] = {
             "gene_count": len(numbers),
@@ -171,8 +188,9 @@ _RUNNERS = {"get_targets": _run_get_targets, "get_expressions": _run_get_express
 def execute_tool(name: str, tool_input: Dict[str, Any]) -> Tuple[str, bool]:
     """Run a tool call from the model. Returns (content, is_error).
 
-    Errors are returned to the model as text rather than raised, so it can
-    explain the problem to the user (e.g. a cancer that is not in the dataset).
+    Problems are returned as text instead of raised: an unknown tool, wrong
+    arguments, or a cancer that is not in the dataset. The model output is
+    untrusted input, so nothing it sends can crash the app.
     """
     runner = _RUNNERS.get(name)
     if runner is None:
@@ -185,7 +203,7 @@ def execute_tool(name: str, tool_input: Dict[str, Any]) -> Tuple[str, bool]:
         return f"Invalid arguments for {name}: {exc}", True
 
 
-# Example usage
+# Example usage, as in the brief
 if __name__ == "__main__":
     cancer = "lung"
     targets = get_targets(cancer)
