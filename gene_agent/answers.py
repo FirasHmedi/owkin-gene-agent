@@ -38,7 +38,7 @@ def invented_terms(text: str) -> List[str]:
     return _DECIMAL.findall(text) + [s for s in _SYMBOL.findall(text) if s not in _NOT_GENES]
 
 
-def write_answer(tool_calls: List["ToolCall"]) -> Optional[str]:
+def write_answer(tool_calls: List["ToolCall"], question: str = "") -> Optional[str]:
     """Write the answer from the tool results of one question.
 
     Returns None when the tools produced nothing to report, in which case the
@@ -58,7 +58,7 @@ def write_answer(tool_calls: List["ToolCall"]) -> Optional[str]:
     paragraphs = []
     for cancer in dict.fromkeys([*targets, *expressions]):
         if cancer in expressions:
-            paragraphs.append(_expressions_text(cancer, expressions[cancer]))
+            paragraphs.append(_expressions_text(cancer, expressions[cancer], question))
         else:
             paragraphs.append(_targets_text(cancer, targets[cancer]))
     if paragraphs:
@@ -87,7 +87,7 @@ def _targets_text(cancer: str, result: Dict[str, Any]) -> str:
     return f"{_alias_note(result)}The dataset lists {len(genes)} genes for {_label(cancer)}: {', '.join(genes)}."
 
 
-def _expressions_text(cancer: str, result: Dict[str, Any]) -> str:
+def _expressions_text(cancer: str, result: Dict[str, Any], question: str = "") -> str:
     values: Dict[str, float] = result["median_values"]
     not_found: List[str] = result["genes_not_found_for_this_cancer"]
     note = _alias_note(result)
@@ -103,6 +103,11 @@ def _expressions_text(cancer: str, result: Dict[str, Any]) -> str:
         # median across them, so the answer gives the table and the overall median.
         summary = result["summary"]
         rows = "\n".join(f"| {gene} | {value} |" for gene, value in values.items())
+        # If the user asked about particular genes but the model fetched them all,
+        # answer the question first and keep the full table as context.
+        asked = [g for g in values if re.search(rf"\b{re.escape(g)}\b", question, re.IGNORECASE)]
+        for gene in asked if len(asked) < len(values) else []:
+            note += f"In {_label(cancer)}, {gene} has a median expression value of **{values[gene]}**. "
         text = (
             f"{note}Median expression values for {len(values)} genes in {_label(cancer)}:\n\n"
             f"| Gene | Median value |\n|---|---|\n{rows}\n\n"

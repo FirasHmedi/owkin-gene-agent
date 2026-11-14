@@ -25,7 +25,7 @@ from ollama import Client, ResponseError
 from .answers import capabilities, invented_terms, write_answer
 from .tools import TOOLS, as_gene_list, available_cancers, execute_tool, find_cancer, is_cancer_name
 
-DEFAULT_MODEL = "qwen3:0.6b"  # override with the OLLAMA_MODEL environment variable
+DEFAULT_MODEL = "qwen3:1.7b"  # override with the OLLAMA_MODEL environment variable
 
 # A question needs at most two tool rounds (targets, then expressions). The cap
 # only exists to stop a model that keeps calling tools.
@@ -46,6 +46,13 @@ the list. The tool reports missing cancers.
 - If the question is not about the data (for example "how can you help me?"), \
 reply in one or two sentences.\
 """
+
+
+SECOND_STEP_REMINDER = (
+    "Check the user's question again. If it asks for expression values or a median, "
+    "call get_expressions now with the genes above and the same cancer. "
+    "If it only asks which genes are involved, reply DONE."
+)
 
 
 @dataclass
@@ -69,7 +76,7 @@ class Reply:
 
 
 class Agent:
-    """One conversation. Keeps the message history so follow-up questions have context."""
+    """One conversation. Remembers the last exchange so follow-up questions have context."""
 
     def __init__(self, client: Optional[Any] = None, model: Optional[str] = None):
         self.client = client or Client()  # reads OLLAMA_HOST, defaults to localhost:11434
@@ -97,15 +104,15 @@ class Agent:
 
     def ask(self, question: str) -> Reply:
         """Answer one question."""
-        start = len(self.messages)
-        self.messages.append({"role": "user", "content": question})
+        previous = self.messages
+        self.messages = [*previous, {"role": "user", "content": question}]
         try:
             model_text, tool_calls = self._run_tools()
         except Exception:
-            del self.messages[start:]  # leave the history as it was before this question
+            self.messages = previous  # leave the history as it was before this question
             raise
 
-        answer = write_answer(tool_calls)
+        answer = write_answer(tool_calls, question)
         if answer:
             reply = Reply(answer, tool_calls, "code")
         elif model_text and not invented_terms(model_text):
@@ -113,10 +120,12 @@ class Agent:
         else:
             reply = Reply(f"I could not match that to the dataset. {capabilities()}", tool_calls, "fallback")
 
-        # Replace the raw tool exchange with what the user actually saw, so a
-        # follow-up ("and their expression values?") builds on the shown answer.
-        del self.messages[start + 1 :]
-        self.messages.append({"role": "assistant", "content": reply.text})
+        # Context for the next question is this exchange only: the question and
+        # the answer the user saw. That is enough for a follow-up ("and their
+        # expression values?"), and it keeps a small model from drifting as a
+        # conversation grows or overflowing its context window.
+        shown = answer or model_text or reply.text
+        self.messages = [{"role": "user", "content": question}, {"role": "assistant", "content": shown}]
         return reply
 
     def _run_tools(self) -> Tuple[str, List[ToolCall]]:
@@ -126,6 +135,7 @@ class Agent:
         """
         tool_calls: List[ToolCall] = []
         already_run = set()
+        reminded = False
 
         for _ in range(MAX_STEPS):
             response = self.client.chat(
@@ -138,6 +148,13 @@ class Agent:
             message = response.message
             self.messages.append(message)
             if not message.tool_calls:
+                # A model sometimes stops after get_targets although the user asked
+                # for values. Ask it once to check before accepting that it is done.
+                names = {c.name for c in tool_calls if not c.is_error}
+                if names == {"get_targets"} and not reminded:
+                    reminded = True
+                    self.messages.append({"role": "system", "content": SECOND_STEP_REMINDER})
+                    continue
                 return (message.content or "").strip(), tool_calls
 
             ran_something_new = False

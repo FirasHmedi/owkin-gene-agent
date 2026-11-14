@@ -7,6 +7,7 @@ services:
 
   app:
     build: .
+    image: gene-data-assistant
     depends_on:
       - ollama
     ports:
