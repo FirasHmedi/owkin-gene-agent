@@ -1,159 +1,162 @@
 # Gene data assistant
 
-A proof-of-concept agent that lets non-technical users query a cancer gene dataset in plain language. It orchestrates the two provided functions, `get_targets` and `get_expressions`, through an LLM tool-calling loop, and ships as a web chat (Docker) and a terminal app.
-
-Contents: [Run it](#run-it) · [What it answers](#what-it-answers) · [Architecture](#architecture) · [Design decisions and trade-offs](#design-decisions-and-trade-offs) · [Changes to the provided functions](#changes-to-the-provided-functions) · [Limitations and next steps](#limitations-and-next-steps) · [AI-assisted coding](#using-ai-assisted-coding-for-this-exercise)
+A small agent that lets non-technical users ask questions about a cancer gene dataset in plain language. It runs entirely on your laptop: a 522 MB language model decides which of the two provided functions to call, and the answer is built from what those functions return. There is no API key and no account, and your questions never leave the machine.
 
 ## Run it
 
-You need an [Anthropic API key](https://console.anthropic.com/) and an internet connection. Nothing else runs locally: no GPU, no model download, well under 1 GB of RAM.
-
-### Web app in Docker (recommended)
+### With Docker (recommended)
 
 ```bash
-cp .env.example .env        # then put your key in .env
 docker compose up --build
 ```
 
-Open http://localhost:8501. If you skip the `.env` step, the page asks for the key in the sidebar instead.
+Then open http://localhost:8501.
 
-On Windows, use `copy .env.example .env` in place of `cp`. The rest is identical.
+This starts two containers: the web app and [Ollama](https://ollama.com), which serves the model. The first start downloads the model (522 MB) into a Docker volume, and the page shows a progress bar while it does. Later starts reuse it.
+
+The same command works on macOS (Apple Silicon or Intel) and Windows 11 with Docker Desktop. No GPU is used.
 
 ### Without Docker
 
-Requires Python 3.12 or newer.
+You need Python 3.12 or newer and Ollama installed and running.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env                 # then put your key in .env
 
 streamlit run streamlit_app.py       # web app on http://localhost:8501
-python cli.py                        # or: terminal chat
+python cli.py                        # or a chat in the terminal
 python cli.py --trace "What are the main genes involved in lung cancer?"
 ```
 
-`--trace` prints the data lookups behind each answer.
+`--trace` prints each data lookup behind the answer.
+
+To try a different model, set `OLLAMA_MODEL` (for example `OLLAMA_MODEL=lfm3`) before starting.
 
 ## What it answers
 
-Wording varies between runs; these are the facts a correct answer contains.
+These are the four queries from the brief with the answers the app gives.
 
-| Query from the brief | What happens | A correct answer contains |
+| Query | What runs | Answer |
 |---|---|---|
-| How can you help me? | No tool call | A description of the two capabilities and example questions |
-| What are the main genes involved in lung cancer? | `get_targets("lung")` | ALK, RET, ROS1, STK11, KRAS |
-| What is the median value expression of genes involved in breast cancer? | `get_targets` then `get_expressions` | The 10 breast values (TP53 = 0.233, BRCA1 = 0.094, ...) and the median across them, 0.4345 |
-| What is the median value expression of genes involved in esophageal cancer? | `get_targets` returns an error | "Not in the dataset", the list of available cancers, and no numbers |
+| How can you help me? | Nothing | A short reply from the model, followed by what the assistant can do and the ten cancers it covers |
+| What are the main genes involved in lung cancer? | `get_targets("lung")` | "The dataset lists 5 genes for lung cancer: ALK, RET, ROS1, STK11, KRAS." |
+| What is the median value expression of genes involved in breast cancer? | `get_targets`, then `get_expressions` | A table of the 10 breast values, then "The median across these 10 genes is 0.4345 (lowest 0.032, highest 0.716)." |
+| What is the median value expression of genes involved in esophageal cancer? | A lookup that fails | "'esophageal' is not in the dataset", then the list of available cancers. No numbers. |
 
-Because the model decides which calls to make, the same loop is designed to cover follow-ups ("and for lung?"), everyday names ("stomach cancer" for gastric), and comparisons across cancers with no extra code.
+"Median value expression of genes" could mean the value of each gene or one median across them, so the answer gives both. The dataset has no ranking of genes, so "main genes" returns every gene listed for that cancer.
 
-## Architecture
+It also handles follow-ups ("and their expression values?"), single genes ("what is the value of BRAF in melanoma?"), and the everyday names stomach and kidney for gastric and renal.
+
+## How it works
 
 ```mermaid
 flowchart LR
     U[User] -->|question| UI[Streamlit chat / CLI]
     UI --> A[Agent loop<br/>gene_agent/agent.py]
-    A <-->|messages + tool definitions| M[Claude API]
-    A -->|tool call| T[get_targets / get_expressions<br/>gene_agent/tools.py]
+    A <-->|messages + tool definitions| M[qwen3:0.6b<br/>served by Ollama]
+    A -->|tool call, after checks| T[get_targets / get_expressions<br/>gene_agent/tools.py]
     T -->|JSON result or error| A
     T --- D[(CSV, 81 rows)]
-    A -->|answer + tool trace| UI
+    A -->|answer written from tool results| UI
 ```
 
 | File | Role |
 |---|---|
-| `gene_agent/tools.py` | The two functions, their tool schemas, and `execute_tool` |
-| `gene_agent/agent.py` | System prompt and the tool-calling loop (about 50 lines) |
-| `gene_agent/errors.py` | Maps API errors to messages a user can act on |
+| `gene_agent/tools.py` | The two functions, their tool definitions, and `execute_tool` |
+| `gene_agent/agent.py` | System prompt, the tool-calling loop, the argument checks, and the answer writer |
+| `gene_agent/errors.py` | Turns model-server errors into messages a user can act on |
 | `streamlit_app.py`, `cli.py` | Two thin front ends over the same `Agent` class |
+| `scripts/compare_models.py` | The questions I used to choose the model |
 
-One request works like this:
+A question goes through four steps.
 
-1. The question is appended to the conversation and sent to the model with the two tool definitions.
-2. If the model asks for a tool, the agent runs it locally and returns the result. An error, such as an unknown cancer, goes back as an error result so the model can explain it.
-3. This repeats until the model answers in text. The loop is capped at 8 rounds.
-4. The UI shows the answer and, in an expandable panel, each lookup with its input and output.
+1. The question and the two tool definitions go to the model. It replies with a tool call or with plain text.
+2. Before a `get_expressions` call runs, the loop checks its arguments. Every gene must appear in the conversation or in an earlier tool result. If one does not, the model made it up, so the loop calls `get_targets` itself and uses the dataset's list. A missing cancer name is read from the user's question.
+3. The call runs and the result goes back to the model, which can call another tool or stop.
+4. If any tool returned data, the answer is written by code from those results. The model's own text is shown only when no data is involved, and it is replaced by a standard reply if it contains anything that looks like a gene symbol or a number.
+
+Under each answer the web app has a panel listing every lookup with its input and output, including the ones the loop added.
+
+## Choosing the model
+
+The brief asks for something that runs on a 16 GB laptop without a specific GPU. Docker on a Mac cannot use the GPU at all, so inside the container the model runs on the CPU. That pushed me toward the smallest model that still does the job, and I set myself a limit of 1 GB.
+
+I compared models from Ollama's library that support tool calling. Each one answered the four brief queries, sixteen paraphrases I used while tuning the loop, and eighteen questions I wrote afterwards and did not tune on. A question passes when the user is shown the right data for the right cancer and nothing else.
+
+| Model | Download | Brief (4) | Tuned (16) | Unseen (18) | Median answer time |
+|---|---|---|---|---|---|
+| qwen2.5:0.5b | 397 MB | 4 | 16 | 16 | 0.6 s |
+| qwen3:0.6b (chosen) | 522 MB | 4 | 16 | 18 | 0.5 s |
+| granite4:350m | 708 MB | 2 | 12 | 13 | 0.5 s |
+| qwen2.5:1.5b | 986 MB | 4 | 14 | 16 | 1.3 s |
+| llama3.2:1b | 1.3 GB | 2 | 11 | 9 | 1.3 s |
+| qwen3:1.7b | 1.4 GB | 4 | 16 | 18 | 1.1 s |
+| lfm3 | 1.7 GB | 4 | 16 | 18 | 1.4 s |
+
+Times are from an Apple M2 Pro with 16 GB, running Ollama natively. With the GPU switched off, which is the situation inside Docker, qwen3:0.6b answered the four brief queries in 1 to 2.3 seconds each. Loaded, it takes about 1 GB of memory. I have not measured an Intel Mac or a Windows laptop.
+
+Two smaller candidates dropped out early. smollm2:360m has no tool support. functiongemma (300 MB) calls a single tool correctly but loops when it has to chain two, and took around 30 seconds on those questions.
+
+I ran qwen3:0.6b several times. It passed all 38 questions every time except once, when it missed one unseen question.
+
+Size did not predict quality. llama3.2:1b is more than twice the size of qwen3:0.6b and did much worse, and qwen2.5:1.5b answered some questions from memory, listing EGFR and MET for lung cancer, which are not in the dataset.
+
+The comparison also showed what the small model cannot do. In all eleven expression questions, qwen3:0.6b went straight to `get_expressions` and never called `get_targets` first. The loop's argument check completed the chain every time. The two 1.4 to 1.7 GB models chained the calls themselves in ten of eleven. So with the default model, the model routes the question and the code does the planning. With a larger model set through `OLLAMA_MODEL`, the same loop lets the model plan and the check rarely fires.
 
 ## Design decisions and trade-offs
 
-The guiding principle: **the model handles language, the code handles data.** The model chooses which function to call and phrases the answer. Every gene name and number comes from a function result. The audience is non-technical and will read an answer as "what our data says", so a fluent wrong number is the worst failure this product can have. Most decisions below follow from that.
+### Local model or hosted API
 
-### 1. A tool-calling loop, not a fixed pipeline or generated code
+My first version called a hosted API (Claude). It was easier to build and the model was far more capable: it chained the two functions on its own and wrote good prose. But a reviewer needed their own API key before anything worked, and the questions left the machine. The brief says the prototype must run on a reviewer's laptop without me, and gives RAM and GPU limits that only make sense for a model running locally. So I switched.
 
-| Option | For | Against |
-|---|---|---|
-| Intent router with fixed steps (classify, then call functions in a set order) | Predictable, cheap, easy to test | Only answers what was anticipated; follow-ups and comparisons each need new branches |
-| **Tool-calling loop (chosen)** | Handles unanticipated phrasing, follow-ups, and multi-cancer questions with no extra code; recovers from tool errors by itself | Non-deterministic; an expression question costs three model round trips |
-| Model writes pandas code against the CSV | Most flexible: any statistic, any filter | Executes generated code; numbers are harder to trust and audit; bypasses the two functions the brief asks to orchestrate |
+What I gave up is model quality, and most of the code in `agent.py` exists to compensate for that. What I gained is that `docker compose up` is the whole setup and that no data leaves the laptop, which matters for a company working with patient data.
 
-For exactly the four queries in the brief, the fixed pipeline would be enough. The loop is the smallest design that still earns the word "agentic": the model plans the calls, and nothing else in the system is model-driven. With two tools, a single agent is sufficient; splitting into several agents would add coordination cost and nothing else.
+### A very small model, with the loop doing more
 
-### 2. No agent framework
+The 1.4 to 1.7 GB models needed fewer guards. I chose one about a third of their size because it is a 522 MB download, answers in one to two seconds on a CPU, and takes about 1 GB of a 16 GB machine. The price is that I had to move work from the model into code, one failure at a time:
 
-The loop is about 50 lines against the Anthropic SDK. LangChain or LangGraph would bring tracing, persistence, and provider abstraction, and also a dependency whose behaviour I would have to explain. At two tools the abstraction costs more than it saves. I would reconsider once there are many tools, long-running tasks, or a need to swap providers. Provider-specific code is confined to `agent.py`.
+| What small models did wrong in testing | What the code does about it |
+|---|---|
+| Skipped `get_targets` and passed genes from memory | Genes must come from the conversation or the dataset, otherwise the loop fetches the dataset's list |
+| Left out the cancer name, or put it in the gene list | The cancer name is recovered from the question |
+| Reported the lowest value as "the median" in its sentence | Answers with data are written by code |
+| Answered from memory without calling a tool | Model text containing a gene symbol or a number is rejected |
+| Repeated the same call | Repeated calls stop the loop |
 
-### 3. A hosted model, not a local one
+This has a cost. Answers with data follow a fixed template, so the assistant does not write a flowing comparison of two cancers; it shows two tables. And each guard was added after seeing a failure, so there may be failures I have not seen. The unseen questions are my check on that, and they are only eighteen questions.
 
-The brief's constraints (16 GB RAM, no GPU, Mac and Windows) allow a small local model through something like Ollama. I chose a hosted model because the priority is that it runs the same on any reviewer's laptop.
+### Why still a tool-calling loop
 
-| | Hosted (chosen) | Local small model |
-|---|---|---|
-| Setup | An API key | A multi-gigabyte download and a model server |
-| Tool-calling reliability | High | Weaker on small models, which is the core of this product |
-| Speed on a CPU-only laptop | Network-bound | Slow, especially on Intel |
-| Data leaves the machine | Yes | No |
-| Cost | Per query | None |
+With the default model the system behaves much like a router: the model identifies the request and code does the rest. A fixed pipeline (classify the question, then call the functions in a set order) would do the same with less machinery. I kept the loop for two reasons. The model still makes the decision that needs language understanding, which is whether the user wants genes, values, one gene, or nothing from the dataset. And the same code gets better when the model does: with lfm3 or qwen3:1.7b the model plans the two calls itself.
 
-The data point matters most in Owkin's setting. Here, the model sees only the question and what the tools return, never the raw file, so exposure is controlled at the tool boundary. With patient-level data, that boundary is where I would enforce aggregation, and the model would need to run inside the data perimeter.
+I also considered letting the model write pandas code against the CSV. It would answer any question, but the numbers would be hard to audit and it bypasses the two functions the brief asks me to orchestrate.
 
-### 4. Fixing the provided function instead of working around it
+### No agent framework
 
-`get_expressions` returned another cancer's value for genes shared across cancers ([details below](#changes-to-the-provided-functions)). No prompt can compensate for that, because the function has no way to know which cancer is meant. I added a `cancer_name` argument. The cost is a changed signature on code I was told to rely on; in a team I would raise it with the function's owner before changing it.
+The loop is about 40 lines on top of the Ollama Python client. LangChain or LangGraph would add tracing and persistence, and also a layer I would have to explain. With two tools I preferred code I can read top to bottom.
 
-### 5. Unknown cancers fail loudly
+### Ollama as the model server
 
-Name handling is split three ways:
+Ollama gives one official Docker image for Intel and ARM, a model download with one call, and tool calling through its chat API. The alternative was to embed llama.cpp in the app container, which removes a container but means compiling native code during the image build. The cost of Ollama is a second container and a large image.
 
-- **Code** normalises trivial variants ("Lung cancer" to "lung").
-- **The model** maps everyday names to dataset names ("kidney" to renal) and says which one it used.
-- **The tool** rejects anything else with an error listing what exists.
-
-I avoided fuzzy matching in code: it risks silently answering about the wrong cancer. I also considered an `enum` on the tool schema, which would make an invalid call impossible. I kept the error path instead, because it makes "not in the dataset" an observable event in the tool trace, not something the model decides on its own.
-
-### 6. Statistics computed in code
-
-The tool returns per-gene values and a summary (count, median, min, max). The prompt tells the model to use those figures. "Median value expression of genes" can mean the per-gene values or one median across them, so the assistant reports both. The cost is that every new statistic needs code; that is the right price while trust in the numbers is the product.
-
-### 7. The cancer list is injected into the system prompt
-
-The prompt is built from the CSV at startup, so the model knows what exists before calling anything and the "how can you help" answer is accurate. This scales poorly: with hundreds of indications it should become a lookup tool.
-
-### 8. Showing the work
-
-Each answer carries its tool calls, shown in an expandable panel and by `--trace` in the CLI. A stakeholder can check which lookup produced a number without trusting the prose. The panel currently shows raw JSON, which is too technical for the target user; a friendlier rendering is a next step.
-
-### 9. Streamlit for the UI
-
-It gives a chat interface in about 100 lines of Python and one container. It is not a production front end: state lives in one process's session, and there is no authentication. The `Agent` class has no UI dependency, so putting it behind an API later does not touch it.
-
-### 10. Smaller choices
+### Smaller choices
 
 | Choice | Why | Cost |
 |---|---|---|
-| Claude Opus 5.5 at low reasoning effort | Reliable tool use; low effort keeps a simple task fast | A smaller model would probably do at lower cost; I have not evaluated one. `ANTHROPIC_MODEL` switches it |
-| Strict tool schemas | Arguments always match the schema | None |
-| Server-side refusal fallback (beta) | Biomedical wording can trip safety classifiers; a declined request is retried on another model in the same call | Depends on a beta feature |
-| No streaming | Simpler code | The answer appears all at once |
-| Conversation kept in memory | Follow-ups work with no storage layer | Lost on refresh; history grows without trimming |
-| Read-only tools, no external content | Little prompt-injection surface: only the user's own question enters the context | Changes as soon as tools write or fetch documents |
+| Temperature 0 | The same question gives the same routing | None for this task |
+| Cancer list in the system prompt, built from the CSV | The model knows what exists | Does not scale to hundreds of cancers |
+| Only two everyday names (stomach, kidney) | They map to exactly one dataset cancer | "Colon" or "brain" are not mapped, because they are not exact matches |
+| Unknown cancers return an error | A wrong guess would answer about a different cancer | The user has to rephrase |
+| Streamlit | A chat UI in about 90 lines | Not a production front end; no login |
+| Conversation kept in memory | Follow-ups work | Lost on refresh |
 
 ## Changes to the provided functions
 
-Profiling the data before writing the agent showed that the script in the brief gives wrong answers to two of the four required queries.
+Before writing the agent I looked at the data, and found that the script in the brief gives wrong answers to two of the four queries.
 
-**1. `get_expressions` returned values from the wrong cancer.** Thirteen genes appear under several cancers with a different value each time (TP53 under 8). The original filters on gene only and builds a dict, so the last matching row in the file wins. For breast cancer, 5 of 10 values were wrong:
+`get_expressions` looks up values by gene only. Thirteen genes appear under more than one cancer with different values (TP53 appears under eight), and the function builds a dictionary, so the last row in the file wins. For breast cancer, five of the ten values came from other cancers:
 
 | Gene | Original returned | Correct (breast) |
 |---|---|---|
@@ -163,36 +166,30 @@ Profiling the data before writing the agent showed that the script in the brief 
 | CDH1 | 0.834 (gastric) | 0.561 |
 | PIK3CA | 0.762 (ovarian) | 0.449 |
 
-Lung was affected too: KRAS came back as 0.241 (pancreatic) instead of 0.359. The fix is a second argument: `get_expressions(genes, cancer_name)`.
+KRAS for lung had the same problem (0.241 from pancreatic, where the lung value is 0.359). I added the cancer as a second argument: `get_expressions(genes, cancer_name)`. No prompt could have fixed this, because the function had no way to know which cancer was meant. On a team I would raise it with the function's owner before changing the signature.
 
-**2. Cancer names had to match exactly.** `get_targets("lung cancer")` and `get_targets("Lung")` returned an empty list, the same as a cancer that does not exist. Names are now normalised, and an unknown cancer raises an error that lists the available ones.
+The second change is to names. `get_targets("lung cancer")` and `get_targets("Lung")` returned an empty list, the same as a cancer that does not exist. Names are now normalised, and an unknown cancer raises an error that lists the available ones.
 
-The unused `import random` was dropped. Function names and return types are otherwise unchanged.
+## Limits and what I would do next
 
-## Limitations and next steps
-
-In rough priority order for turning this into a product:
-
-1. **Evaluation.** There is no measured answer quality beyond the four queries. The first investment would be a question set (synonyms, typos, out-of-scope requests, comparisons) scored on every prompt or model change, which would also settle whether a cheaper model is good enough.
-2. **Observability.** Tool traces, token usage, and latency are not logged. Cost and latency per question are unmeasured.
-3. **Data perimeter.** For real data: a model deployment inside the perimeter, and aggregation rules enforced in the tools.
-4. **Coverage of the functions.** Lookups are per cancer; "which cancers involve TP53?" needs a reverse lookup. Gene aliases are not reconciled (`HER2` under breast and `ERBB2` under gastric are the same gene). The values have no unit or provenance in the CSV, so the assistant reports them as given.
-5. **Product basics.** Authentication, saved conversations, streaming, a non-technical view of the tool trace.
+- The comparison is 38 questions on one laptop. Before trusting it further I would add typos, longer conversations, and questions about two cancers at once, and run it on a Windows machine.
+- Lookups work per cancer. "Which cancers involve TP53?" needs a reverse lookup that the two functions do not offer.
+- The data lists HER2 under breast and ERBB2 under gastric. They are the same gene and the app does not reconcile them.
+- The values have no unit or source in the CSV, so the assistant reports them as given.
+- There is no login, no saved history, and no logging of questions or response times.
 
 ## Using AI-assisted coding for this exercise
 
-This prototype was built with an AI coding assistant (Claude Code).
+I built this with an AI coding assistant (Claude Code), and I think the honest account includes where it went wrong.
 
-**Where it helped**
+It was fast at the parts that are not the point of the exercise: the Dockerfile, the Streamlit wiring, the comparison script. It also looked at the dataset before writing any agent code, which is how the `get_expressions` bug came up in the first few minutes.
 
-- Speed on the parts that are not the point: Dockerfile, Streamlit wiring, this README's structure.
-- It profiled the dataset before writing any agent code, which is how the `get_expressions` bug surfaced early.
-- It worked from current SDK documentation, which matters because the API changed in ways older examples get wrong.
+It did not question the brief the way I had to. Its first design used a hosted API, which works well and is the path most examples take. Rereading the requirements, I decided the solution had to run locally on a small model, and that changed most of the design.
 
-**Where it needed care**
+Its knowledge of small models was out of date. The model names it knew were a generation old, so the candidate list had to come from Ollama's current library and the choice from running them.
 
-- I have to defend every line in front of a panel, so the code was kept small enough to read in full.
-- Assistants tend to add abstraction and options. Scope was held to two tools, one loop, two thin front ends.
-- Design judgment is not delegated: which trade-offs to accept above are decisions an assistant can list but not own.
-- It is not a substitute for running the real thing against the real model.
-- On real projects, sending proprietary code or patient-level data to an assistant is a confidentiality question to settle first. Here the data is a small synthetic table.
+The generated code looked finished before it was correct. The first local version let the model write the final sentence, and for breast cancer it stated the lowest value as the median, in a fluent and confident sentence above a correct table. I only caught it by reading the actual answers. That is why answers with data are now written by code.
+
+It also tends to add options and abstractions. I kept cutting scope back to two tools, one loop, and two thin front ends, because I have to be able to explain every line.
+
+For real work at a company like Owkin there is one more question to settle first, which is what code and data may be sent to an assistant at all. Here the data is a small synthetic table.
