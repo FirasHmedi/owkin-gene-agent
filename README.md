@@ -2,13 +2,27 @@
 
 A small agent that lets non-technical users ask questions about a cancer gene dataset in plain language. It runs entirely on a laptop. A 1.4 GB language model decides which of the two provided functions to call, and the answer is built from what those functions return. There is no API key and no account, and your questions never leave the machine.
 
+## Quick start
+
+You need Docker and nothing else.
+
+```bash
+git clone https://github.com/FirasHmedi/owkin-gene-agent.git
+cd owkin-gene-agent
+docker compose up --build
+```
+
+Open http://localhost:8501 and click one of the example questions. The first start takes a few minutes, because it builds the app and downloads the model (1.4 GB). Stop it with Ctrl+C.
+
+[![docker](https://github.com/FirasHmedi/owkin-gene-agent/actions/workflows/docker.yml/badge.svg)](https://github.com/FirasHmedi/owkin-gene-agent/actions/workflows/docker.yml) This check builds the same Docker setup on GitHub and asks the four queries from the brief on every change.
+
 ## How this meets the brief
 
 | Requirement | Where it is met |
 |---|---|
 | Relevant answers to the four example queries | [What it answers](#what-it-answers) |
-| Runs on another laptop without me | One command, no key or account: [Run it](#run-it) |
-| README with run instructions and a design overview | [Run it](#run-it), [How it works](#how-it-works) |
+| Runs on another laptop without me | One command, no key or account: [Quick start](#quick-start) |
+| README with run instructions and a design overview | [Quick start](#quick-start), [How it works](#how-it-works) |
 | Web application in Docker preferred, command line acceptable | Both are included |
 | Python | Python 3.12 |
 | Mac or Windows 11 laptop, 16 GB RAM or less | The model takes about 1.9 GB of memory |
@@ -16,15 +30,9 @@ A small agent that lets non-technical users ask questions about a cancer gene da
 | Architecture, use and trade-offs of the AI components | [Design and trade-offs](#design-and-trade-offs) |
 | Pros and cons of AI-assisted coding | [Using AI-assisted coding](#using-ai-assisted-coding) |
 
-## Run it
+## Other ways to run it
 
-With Docker:
-
-```bash
-docker compose up --build
-```
-
-Then open http://localhost:8501. This starts the web app and [Ollama](https://ollama.com), which serves the model. The first start downloads the model (1.4 GB) into a Docker volume and shows a progress bar. Later starts reuse it.
+`docker compose up --build` starts two containers: the web app and [Ollama](https://ollama.com), which serves the model. The model is stored in a Docker volume, so later starts are quick.
 
 Without Docker, you need Python 3.12 or newer and Ollama installed and running:
 
